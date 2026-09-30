@@ -4,27 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '选择运行模式：full 正式编译 / preflight 仅预检'
+        description: '运行模式'
         required: true
         default: 'full'
         type: choice
         options:
           - full
           - preflight
+
       expected_source_sha256:
-        description: 'BuildMate 本地源码 ZIP SHA-256'
+        description: '源码 ZIP SHA-256'
         required: false
         default: ''
+
       expected_source_bytes:
-        description: 'BuildMate 本地源码 ZIP 字节数'
+        description: '源码 ZIP 字节数'
         required: false
         default: ''
+
       source_name:
-        description: 'BuildMate 选择的源码文件名'
+        description: '源码文件名'
         required: false
         default: ''
+
       expected_head_sha:
-        description: 'BuildMate 派发前分支 HEAD SHA'
+        description: '派发前 HEAD SHA'
         required: false
         default: ''
 
@@ -38,6 +42,7 @@ jobs:
     timeout-minutes: 35
 
     steps:
+
       - name: 1. 读取仓库
         uses: actions/checkout@v4
         with:
@@ -48,182 +53,167 @@ jobs:
         shell: bash
         run: |
           MODE='${{ inputs.mode }}'
+
           case "$MODE" in
-            full|preflight) ;;
-            *) MODE='full' ;;
+            full|preflight)
+              ;;
+            *)
+              MODE='full'
+              ;;
           esac
+
           [ -n "$MODE" ] || MODE='full'
+
           echo "value=$MODE" >> "$GITHUB_OUTPUT"
           echo "BuildMate mode: $MODE"
 
-      - name: 1.7 源码指纹门
-        id: source_trace
+      - name: 1.7 源码指纹校验
         shell: bash
         run: |
           set -e
-          test -f app.zip || { echo '❌ 根目录缺少 app.zip'; exit 1; }
 
-          mkdir -p .buildmate
+          test -f app.zip || {
+            echo '❌ 仓库根目录没有 app.zip'
+            exit 1
+          }
 
           ACTUAL_SHA=$(shasum -a 256 app.zip | awk '{print $1}')
           ACTUAL_BYTES=$(wc -c < app.zip | tr -d ' ')
-          CHECKOUT_SHA=$(git rev-parse HEAD)
 
           EXPECTED_SHA='${{ inputs.expected_source_sha256 }}'
           EXPECTED_BYTES='${{ inputs.expected_source_bytes }}'
-          EXPECTED_HEAD='${{ inputs.expected_head_sha }}'
-          SOURCE_NAME='${{ inputs.source_name }}'
 
-          echo "源码文件: $SOURCE_NAME"
-          echo "Actions checkout: $CHECKOUT_SHA"
-          echo "派发前 HEAD: $EXPECTED_HEAD"
-          echo "app.zip SHA-256: $ACTUAL_SHA"
-          echo "期望 SHA-256: $EXPECTED_SHA"
-          echo "app.zip bytes: $ACTUAL_BYTES / expected: $EXPECTED_BYTES"
+          echo "实际 SHA256: $ACTUAL_SHA"
+          echo "期望 SHA256: $EXPECTED_SHA"
 
-          TRACE_OK=true
+          echo "实际大小: $ACTUAL_BYTES"
+          echo "期望大小: $EXPECTED_BYTES"
 
           if [ -n "$EXPECTED_SHA" ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            TRACE_OK=false
-          fi
-
-          if [ -n "$EXPECTED_BYTES" ] && [ "$ACTUAL_BYTES" != "$EXPECTED_BYTES" ]; then
-            TRACE_OK=false
-          fi
-
-          export SOURCE_NAME ACTUAL_SHA EXPECTED_SHA ACTUAL_BYTES EXPECTED_BYTES CHECKOUT_SHA EXPECTED_HEAD TRACE_OK
-
-          python3 - <<'PY'
-          import json, os, pathlib
-
-          d = {
-              'sourceName': os.environ.get('SOURCE_NAME', ''),
-              'sourceSHA256': os.environ.get('ACTUAL_SHA', ''),
-              'expectedSourceSHA256': os.environ.get('EXPECTED_SHA', ''),
-              'sourceBytes': os.environ.get('ACTUAL_BYTES', ''),
-              'expectedSourceBytes': os.environ.get('EXPECTED_BYTES', ''),
-              'checkoutSHA': os.environ.get('CHECKOUT_SHA', ''),
-              'expectedHeadSHA': os.environ.get('EXPECTED_HEAD', ''),
-              'sourceTraceOK': os.environ.get('TRACE_OK', 'true') == 'true'
-          }
-
-          pathlib.Path('.buildmate/source-trace.json').write_text(
-              json.dumps(d, ensure_ascii=False, indent=2)
-          )
-          PY
-
-          if [ "$TRACE_OK" != true ]; then
-            echo '❌ 源码指纹不一致：已阻止编译。'
+            echo '❌ SHA256 不一致'
             exit 86
           fi
 
-          echo '✅ 源码指纹一致。'
+          if [ -n "$EXPECTED_BYTES" ] && [ "$ACTUAL_BYTES" != "$EXPECTED_BYTES" ]; then
+            echo '❌ 文件大小不一致'
+            exit 87
+          fi
 
-      - name: 2. 解压并识别工程
-        id: inspect
+          echo '✅ 源码校验通过'
+
+      - name: 2. 解压源码
         shell: bash
         run: |
           set -e
 
-          rm -rf src .buildmate-work
-          mkdir -p src .buildmate-work .buildmate
+          rm -rf src
+          mkdir src
+
           unzip -q app.zip -d src
 
-          ROOT=src
+          echo "===== ZIP 根目录 ====="
+          ls -la src
 
-          if [ ! -f src/Makefile ] && [ ! -f src/project.yml ] && ! find src -maxdepth 1 -type d \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) | grep -q .; then
-            P=$(find src -type f \( -name Makefile -o -name project.yml \) | head -1 || true)
+          # 如果 ZIP 外面多套了一层目录，自动寻找 project.yml
+          if [ ! -f src/project.yml ]; then
 
-            [ -z "$P" ] && P=$(find src -type d \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) | head -1 || true)
+            PROJECT=$(find src -type f -name project.yml | head -1 || true)
 
-            [ -n "$P" ] && ROOT=$(dirname "$P")
+            if [ -n "$PROJECT" ]; then
 
-            if [ "$ROOT" != src ]; then
-              mkdir .buildmate-work/root
-              cp -R "$ROOT"/. .buildmate-work/root/
+              ROOT=$(dirname "$PROJECT")
+
+              echo "检测到工程目录：$ROOT"
+
+              mkdir fixed-root
+              cp -R "$ROOT"/. fixed-root/
+
               rm -rf src
-              mv .buildmate-work/root src
+              mv fixed-root src
             fi
           fi
 
-          if [ -f src/Makefile ] && { [ -f src/control ] || [ -f src/layout/DEBIAN/control ] || grep -q 'THEOS' src/Makefile; }; then
-            TYPE=theos
-            FILE=Makefile
-          elif [ -f src/project.yml ]; then
-            TYPE=xcodegen
-            FILE=project.yml
-          elif P=$(find src -maxdepth 1 -type d -name '*.xcworkspace' | head -1) && [ -n "$P" ]; then
-            TYPE=workspace
-            FILE=$(basename "$P")
-          elif P=$(find src -maxdepth 1 -type d -name '*.xcodeproj' | head -1) && [ -n "$P" ]; then
-            TYPE=xcodeproj
-            FILE=$(basename "$P")
-          else
-            echo '❌ 无法识别 Theos / project.yml / xcodeproj / xcworkspace'
-            exit 1
+          test -f src/project.yml || {
+            echo '❌ 找不到 project.yml'
+            exit 31
+          }
+
+          echo '✅ 工程结构识别成功'
+
+      - name: 3. 安装 XcodeGen
+        if: ${{ steps.mode.outputs.value != 'preflight' }}
+        shell: bash
+        run: |
+          set -e
+
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
           fi
 
-          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          xcodegen --version
 
-      - name: 4A. 准备 Xcode 工程
-        if: ${{ steps.inspect.outputs.type != 'theos' }}
-        id: xcode
+      - name: 4. 生成 Xcode 工程
+        if: ${{ steps.mode.outputs.value != 'preflight' }}
         working-directory: src
         shell: bash
         run: |
           set -e
 
-          TYPE='${{ steps.inspect.outputs.type }}'
-          FILE='${{ steps.inspect.outputs.file }}'
+          xcodegen generate
 
-          if [ "$TYPE" = xcodegen ]; then
-            brew install xcodegen >/dev/null
-            xcodegen generate
-            FILE=$(find . -maxdepth 1 -name '*.xcodeproj' | head -1)
-            TYPE=xcodeproj
-          fi
+          echo "===== 生成结果 ====="
+          ls -la
 
-          if [ "$TYPE" = workspace ]; then
-            LIST=$(xcodebuild -workspace "$FILE" -list -json)
-            SCHEME=$(printf '%s' "$LIST" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('workspace',{}).get('schemes',[]);print(s[0] if s else '')")
-          else
-            LIST=$(xcodebuild -project "$FILE" -list -json)
-            SCHEME=$(printf '%s' "$LIST" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('project',{}).get('schemes',[]);print(s[0] if s else '')")
-          fi
+          PROJECT=$(find . -maxdepth 1 -name '*.xcodeproj' | head -1)
+
+          test -n "$PROJECT" || {
+            echo '❌ XcodeGen 没有生成 xcodeproj'
+            exit 41
+          }
+
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+
+          LIST=$(xcodebuild \
+            -project "$PROJECT" \
+            -list \
+            -json)
+
+          SCHEME=$(printf '%s' "$LIST" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          schemes=d.get('project',{}).get('schemes',[])
+          print(schemes[0] if schemes else '')
+          ")
 
           test -n "$SCHEME" || {
             echo '❌ 找不到 Scheme'
-            exit 1
+            exit 42
           }
 
-          echo "kind=$TYPE" >> "$GITHUB_OUTPUT"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
 
-      - name: 5A. Xcode 编译 IPA
-        if: ${{ steps.inspect.outputs.type != 'theos' && steps.mode.outputs.value != 'preflight' }}
+          echo "Project: $PROJECT"
+          echo "Scheme: $SCHEME"
+
+      - name: 5. Xcode 编译并制作 IPA
+        if: ${{ steps.mode.outputs.value != 'preflight' }}
         id: ipa
         working-directory: src
         shell: bash
         run: |
           set -o pipefail
 
-          TYPE='${{ steps.xcode.outputs.kind }}'
-          FILE='${{ steps.xcode.outputs.file }}'
-          SCHEME='${{ steps.xcode.outputs.scheme }}'
+          echo "===== 开始 Xcode 编译 ====="
 
-          rm -rf build compile.log compile-errors.txt
-
-          if [ "$TYPE" = workspace ]; then
-            BASE=(xcodebuild -workspace "$FILE" -scheme "$SCHEME")
-          else
-            BASE=(xcodebuild -project "$FILE" -scheme "$SCHEME")
-          fi
+          rm -rf build
+          rm -rf Payload
+          rm -f *.ipa
 
           set +e
 
-          "${BASE[@]}" \
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
@@ -233,52 +223,184 @@ jobs:
             build 2>&1 | tee compile.log
 
           STATUS=${PIPESTATUS[0]}
+
           set -e
 
           if [ "$STATUS" -ne 0 ]; then
-            grep -n -B 2 -A 5 -E 'error:|fatal error:|SwiftCompile|CompileSwift|EmitSwiftModule|Command SwiftCompile failed' compile.log | tail -320 > compile-errors.txt || true
+
+            echo "❌ Xcode 编译失败"
+
+            grep -n \
+              -B 3 \
+              -A 8 \
+              -E 'error:|fatal error:|SwiftCompile|CompileSwift|EmitSwiftModule|Command SwiftCompile failed' \
+              compile.log \
+              | tail -400 \
+              > compile-errors.txt || true
 
             if [ ! -s compile-errors.txt ]; then
-              tail -240 compile.log > compile-errors.txt || true
+              tail -300 compile.log > compile-errors.txt
             fi
 
             exit "$STATUS"
           fi
 
-          APP=$(find build/Build/Products -type d -path '*Release-iphoneos/*.app' | head -1 || true)
+          echo "===== Xcode BUILD SUCCEEDED ====="
 
-          test -n "$APP" || {
-            echo '❌ 没找到编译后的 APP'
-            exit 1
-          }
+          echo "===== 搜索生成的 APP ====="
+
+          APP=$(find -L \
+            build/Build/Products \
+            -type d \
+            -name '*.app' \
+            -path '*Release-iphoneos*' \
+            -print \
+            -quit \
+            2>/dev/null || true)
+
+          #
+          # 如果 find 没找到，直接问 Xcode 实际输出目录
+          #
+
+          if [ -z "$APP" ]; then
+
+            echo "普通搜索未找到 APP，使用 Xcode Build Settings 精确定位"
+
+            SETTINGS=$(xcodebuild \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath build \
+              -showBuildSettings \
+              2>/dev/null || true)
+
+            TARGET_BUILD_DIR=$(printf '%s\n' "$SETTINGS" \
+              | awk -F' = ' '/ TARGET_BUILD_DIR = / {print $2; exit}')
+
+            FULL_PRODUCT_NAME=$(printf '%s\n' "$SETTINGS" \
+              | awk -F' = ' '/ FULL_PRODUCT_NAME = / {print $2; exit}')
+
+            echo "TARGET_BUILD_DIR=$TARGET_BUILD_DIR"
+            echo "FULL_PRODUCT_NAME=$FULL_PRODUCT_NAME"
+
+            if [ -n "$TARGET_BUILD_DIR" ] && \
+               [ -n "$FULL_PRODUCT_NAME" ] && \
+               [ -d "$TARGET_BUILD_DIR/$FULL_PRODUCT_NAME" ]; then
+
+              APP="$TARGET_BUILD_DIR/$FULL_PRODUCT_NAME"
+            fi
+          fi
+
+          #
+          # 最后一层兜底搜索
+          #
+
+          if [ -z "$APP" ]; then
+
+            echo "执行全 build 目录兜底搜索"
+
+            APP=$(find -L build \
+              -type d \
+              -name '*.app' \
+              -print \
+              -quit \
+              2>/dev/null || true)
+          fi
+
+          if [ -z "$APP" ]; then
+
+            echo '❌ Xcode 已经 BUILD SUCCEEDED，但仍找不到 .app'
+
+            echo "===== build 目录 ====="
+
+            find build \
+              -maxdepth 8 \
+              -type d \
+              | tail -300 || true
+
+            exit 51
+          fi
+
+          echo "✅ 找到 APP：$APP"
+
+          #
+          # 校验 Info.plist
+          #
 
           PLIST="$APP/Info.plist"
-          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null || true)
 
-          test -n "$EXEC" && test -f "$APP/$EXEC" || {
-            echo '❌ 主程序校验失败'
-            exit 1
+          test -f "$PLIST" || {
+            echo '❌ APP 中没有 Info.plist'
+            exit 52
           }
 
-          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null || echo unknown)
+          EXEC=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$PLIST" \
+            2>/dev/null || true)
 
-          IPA="${EXEC}-V${VER}.ipa"
+          VERSION=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleShortVersionString' \
+            "$PLIST" \
+            2>/dev/null || echo "1.0.0")
 
-          rm -rf Payload "$IPA"
+          test -n "$EXEC" || {
+            echo '❌ 无法读取 CFBundleExecutable'
+            exit 53
+          }
+
+          test -f "$APP/$EXEC" || {
+            echo "❌ APP 主程序不存在：$APP/$EXEC"
+            exit 54
+          }
+
+          echo "Executable: $EXEC"
+          echo "Version: $VERSION"
+
+          #
+          # 制作 Payload
+          #
+
+          rm -rf Payload
           mkdir Payload
+
           cp -R "$APP" Payload/
+
+          IPA="QingJian-V${VERSION}.ipa"
+
+          echo "===== 制作 IPA ====="
+
           zip -qry "$IPA" Payload
+
+          test -f "$IPA" || {
+            echo '❌ IPA 创建失败'
+            exit 55
+          }
+
+          #
+          # 校验 IPA
+          #
+
           unzip -tq "$IPA"
+
+          IPA_BYTES=$(wc -c < "$IPA" | tr -d ' ')
+
+          echo "IPA: $IPA"
+          echo "IPA bytes: $IPA_BYTES"
 
           echo "file=$IPA" >> "$GITHUB_OUTPUT"
 
-      - name: 6A. 上传 IPA
-        if: ${{ steps.inspect.outputs.type != 'theos' && steps.mode.outputs.value != 'preflight' && success() }}
+          echo "===== IPA 制作完成 ====="
+
+      - name: 6. 上传 IPA
+        if: ${{ steps.mode.outputs.value != 'preflight' && success() }}
         uses: actions/upload-artifact@v4
         with:
-          name: IPA-${{ github.run_number }}
+          name: QingJian-IPA-${{ github.run_number }}
           path: src/${{ steps.ipa.outputs.file }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: 9. 上传失败日志
         if: failure()
@@ -288,5 +410,5 @@ jobs:
           path: |
             src/compile.log
             src/compile-errors.txt
-            .buildmate/source-trace.json
           if-no-files-found: ignore
+          retention-days: 30
