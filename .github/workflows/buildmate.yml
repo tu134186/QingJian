@@ -1,95 +1,292 @@
-name: BuildMate Linux Preflight
+name: BuildMate Multi Builder
+
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: '选择运行模式：full 正式编译 / preflight 仅预检'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - preflight
       expected_source_sha256:
-        description: Expected app.zip SHA-256
-        required: true
-        type: string
+        description: 'BuildMate 本地源码 ZIP SHA-256'
+        required: false
+        default: ''
       expected_source_bytes:
-        description: Expected app.zip bytes
-        required: true
-        type: string
+        description: 'BuildMate 本地源码 ZIP 字节数'
+        required: false
+        default: ''
       source_name:
-        description: Original source name
+        description: 'BuildMate 选择的源码文件名'
         required: false
-        type: string
-      repair_mode:
-        description: Apply .buildmate/repair-plan.json before static checks
+        default: ''
+      expected_head_sha:
+        description: 'BuildMate 派发前分支 HEAD SHA'
         required: false
-        default: 'false'
-        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
 jobs:
-  preflight:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+
     steps:
-      - name: Checkout
+      - name: 1. 读取仓库
         uses: actions/checkout@v4
-      - name: Source fingerprint gate
+        with:
+          fetch-depth: 0
+
+      - name: 1.5 规范运行模式
+        id: mode
         shell: bash
         run: |
-          set -euo pipefail
-          test -f app.zip || { echo '❌ repo root missing app.zip'; exit 21; }
-          ACTUAL_SHA="$(sha256sum app.zip | awk '{print $1}')"
-          ACTUAL_BYTES="$(wc -c < app.zip | tr -d ' ')"
-          echo "source=${{ inputs.source_name }}"
-          echo "sha256=$ACTUAL_SHA"
-          echo "bytes=$ACTUAL_BYTES"
-          test "$ACTUAL_SHA" = "${{ inputs.expected_source_sha256 }}" || { echo '❌ SHA-256 mismatch'; exit 22; }
-          test "$ACTUAL_BYTES" = "${{ inputs.expected_source_bytes }}" || { echo '❌ byte count mismatch'; exit 23; }
-          unzip -tq app.zip
-      - name: Extract and structural checks
+          MODE='${{ inputs.mode }}'
+          case "$MODE" in
+            full|preflight) ;;
+            *) MODE='full' ;;
+          esac
+          [ -n "$MODE" ] || MODE='full'
+          echo "value=$MODE" >> "$GITHUB_OUTPUT"
+          echo "BuildMate mode: $MODE"
+
+      - name: 1.7 源码指纹门
+        id: source_trace
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf src && mkdir src
-          unzip -q app.zip -d src
-          if [ ! -f src/project.yml ]; then
-            P="$(find src -type f -name project.yml | head -1 || true)"
-            if [ -n "$P" ]; then ROOT="$(dirname "$P")"; mkdir moved; cp -R "$ROOT"/. moved/; rm -rf src; mv moved src; fi
+          set -e
+          test -f app.zip || { echo '❌ 根目录缺少 app.zip'; exit 1; }
+
+          mkdir -p .buildmate
+
+          ACTUAL_SHA=$(shasum -a 256 app.zip | awk '{print $1}')
+          ACTUAL_BYTES=$(wc -c < app.zip | tr -d ' ')
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+
+          EXPECTED_SHA='${{ inputs.expected_source_sha256 }}'
+          EXPECTED_BYTES='${{ inputs.expected_source_bytes }}'
+          EXPECTED_HEAD='${{ inputs.expected_head_sha }}'
+          SOURCE_NAME='${{ inputs.source_name }}'
+
+          echo "源码文件: $SOURCE_NAME"
+          echo "Actions checkout: $CHECKOUT_SHA"
+          echo "派发前 HEAD: $EXPECTED_HEAD"
+          echo "app.zip SHA-256: $ACTUAL_SHA"
+          echo "期望 SHA-256: $EXPECTED_SHA"
+          echo "app.zip bytes: $ACTUAL_BYTES / expected: $EXPECTED_BYTES"
+
+          TRACE_OK=true
+
+          if [ -n "$EXPECTED_SHA" ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            TRACE_OK=false
           fi
-          test -f src/project.yml || { echo '❌ project.yml missing'; exit 31; }
-          test -d src/BuildMate || { echo '❌ BuildMate source directory missing'; exit 32; }
-          test -f src/BuildMate/Info.plist || { echo '❌ Info.plist missing'; exit 33; }
-          if [ -f src/scripts/check_release_version.py ]; then (cd src && python3 scripts/check_release_version.py); fi
-      - name: Apply repair plan for AI preflight
-        if: ${{ inputs.repair_mode == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
+
+          if [ -n "$EXPECTED_BYTES" ] && [ "$ACTUAL_BYTES" != "$EXPECTED_BYTES" ]; then
+            TRACE_OK=false
+          fi
+
+          export SOURCE_NAME ACTUAL_SHA EXPECTED_SHA ACTUAL_BYTES EXPECTED_BYTES CHECKOUT_SHA EXPECTED_HEAD TRACE_OK
+
           python3 - <<'PY'
-          import json,pathlib
-          plan=pathlib.Path('.buildmate/repair-plan.json')
-          root=pathlib.Path('src')
-          if not plan.exists(): raise SystemExit('❌ repair plan missing')
-          obj=json.loads(plan.read_text())
-          import hashlib
-          current=hashlib.sha256(pathlib.Path('app.zip').read_bytes()).hexdigest()
-          bound=str(obj.get('sourceSHA256') or obj.get('source_sha256') or '').strip().lower()
-          if not bound or bound != current.lower():
-              print('⚠️ stale repair plan isolated: Source SHA mismatch/missing')
-              raise SystemExit(0)
-          patches=obj.get('patches') or []
-          if not patches: raise SystemExit('❌ repair plan has no patches')
-          for p in patches:
-            rel=p.get('path',''); old=p.get('search',''); new=p.get('replace','')
-            f=root/rel
-            if not f.is_file() or not old or len(old)>5000 or len(new)>5000: raise SystemExit('❌ unsafe patch')
-            text=f.read_text(errors='ignore'); n=text.count(old)
-            if n != 1: raise SystemExit(f'❌ patch must hit once, got {n}: {rel}')
-            f.write_text(text.replace(old,new,1))
-          print(f'✅ applied {len(patches)} repair patches for Linux preflight')
+          import json, os, pathlib
+
+          d = {
+              'sourceName': os.environ.get('SOURCE_NAME', ''),
+              'sourceSHA256': os.environ.get('ACTUAL_SHA', ''),
+              'expectedSourceSHA256': os.environ.get('EXPECTED_SHA', ''),
+              'sourceBytes': os.environ.get('ACTUAL_BYTES', ''),
+              'expectedSourceBytes': os.environ.get('EXPECTED_BYTES', ''),
+              'checkoutSHA': os.environ.get('CHECKOUT_SHA', ''),
+              'expectedHeadSHA': os.environ.get('EXPECTED_HEAD', ''),
+              'sourceTraceOK': os.environ.get('TRACE_OK', 'true') == 'true'
+          }
+
+          pathlib.Path('.buildmate/source-trace.json').write_text(
+              json.dumps(d, ensure_ascii=False, indent=2)
+          )
           PY
-      - name: Static high-frequency bug scan
+
+          if [ "$TRACE_OK" != true ]; then
+            echo '❌ 源码指纹不一致：已阻止编译。'
+            exit 86
+          fi
+
+          echo '✅ 源码指纹一致。'
+
+      - name: 2. 解压并识别工程
+        id: inspect
         shell: bash
         run: |
-          set -euo pipefail
-          cd src
-          ! grep -R --line-number --include='*.swift' 'ActivityShareSheet(items: shareItems)' BuildMate || { echo '❌ stale ActivityShareSheet regression'; exit 41; }
-          if command -v swiftc >/dev/null 2>&1; then
-            find BuildMate -name '*.swift' -print0 | xargs -0 swiftc -parse
-          else
-            echo 'ℹ️ ubuntu runner has no swiftc; syntax parse skipped'
+          set -e
+
+          rm -rf src .buildmate-work
+          mkdir -p src .buildmate-work .buildmate
+          unzip -q app.zip -d src
+
+          ROOT=src
+
+          if [ ! -f src/Makefile ] && [ ! -f src/project.yml ] && ! find src -maxdepth 1 -type d \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) | grep -q .; then
+            P=$(find src -type f \( -name Makefile -o -name project.yml \) | head -1 || true)
+
+            [ -z "$P" ] && P=$(find src -type d \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) | head -1 || true)
+
+            [ -n "$P" ] && ROOT=$(dirname "$P")
+
+            if [ "$ROOT" != src ]; then
+              mkdir .buildmate-work/root
+              cp -R "$ROOT"/. .buildmate-work/root/
+              rm -rf src
+              mv .buildmate-work/root src
+            fi
           fi
-          echo '✅ Linux preflight passed; macOS/Xcode may start now.'
+
+          if [ -f src/Makefile ] && { [ -f src/control ] || [ -f src/layout/DEBIAN/control ] || grep -q 'THEOS' src/Makefile; }; then
+            TYPE=theos
+            FILE=Makefile
+          elif [ -f src/project.yml ]; then
+            TYPE=xcodegen
+            FILE=project.yml
+          elif P=$(find src -maxdepth 1 -type d -name '*.xcworkspace' | head -1) && [ -n "$P" ]; then
+            TYPE=workspace
+            FILE=$(basename "$P")
+          elif P=$(find src -maxdepth 1 -type d -name '*.xcodeproj' | head -1) && [ -n "$P" ]; then
+            TYPE=xcodeproj
+            FILE=$(basename "$P")
+          else
+            echo '❌ 无法识别 Theos / project.yml / xcodeproj / xcworkspace'
+            exit 1
+          fi
+
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: 4A. 准备 Xcode 工程
+        if: ${{ steps.inspect.outputs.type != 'theos' }}
+        id: xcode
+        working-directory: src
+        shell: bash
+        run: |
+          set -e
+
+          TYPE='${{ steps.inspect.outputs.type }}'
+          FILE='${{ steps.inspect.outputs.file }}'
+
+          if [ "$TYPE" = xcodegen ]; then
+            brew install xcodegen >/dev/null
+            xcodegen generate
+            FILE=$(find . -maxdepth 1 -name '*.xcodeproj' | head -1)
+            TYPE=xcodeproj
+          fi
+
+          if [ "$TYPE" = workspace ]; then
+            LIST=$(xcodebuild -workspace "$FILE" -list -json)
+            SCHEME=$(printf '%s' "$LIST" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('workspace',{}).get('schemes',[]);print(s[0] if s else '')")
+          else
+            LIST=$(xcodebuild -project "$FILE" -list -json)
+            SCHEME=$(printf '%s' "$LIST" | python3 -c "import json,sys;d=json.load(sys.stdin);s=d.get('project',{}).get('schemes',[]);print(s[0] if s else '')")
+          fi
+
+          test -n "$SCHEME" || {
+            echo '❌ 找不到 Scheme'
+            exit 1
+          }
+
+          echo "kind=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: 5A. Xcode 编译 IPA
+        if: ${{ steps.inspect.outputs.type != 'theos' && steps.mode.outputs.value != 'preflight' }}
+        id: ipa
+        working-directory: src
+        shell: bash
+        run: |
+          set -o pipefail
+
+          TYPE='${{ steps.xcode.outputs.kind }}'
+          FILE='${{ steps.xcode.outputs.file }}'
+          SCHEME='${{ steps.xcode.outputs.scheme }}'
+
+          rm -rf build compile.log compile-errors.txt
+
+          if [ "$TYPE" = workspace ]; then
+            BASE=(xcodebuild -workspace "$FILE" -scheme "$SCHEME")
+          else
+            BASE=(xcodebuild -project "$FILE" -scheme "$SCHEME")
+          fi
+
+          set +e
+
+          "${BASE[@]}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build 2>&1 | tee compile.log
+
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            grep -n -B 2 -A 5 -E 'error:|fatal error:|SwiftCompile|CompileSwift|EmitSwiftModule|Command SwiftCompile failed' compile.log | tail -320 > compile-errors.txt || true
+
+            if [ ! -s compile-errors.txt ]; then
+              tail -240 compile.log > compile-errors.txt || true
+            fi
+
+            exit "$STATUS"
+          fi
+
+          APP=$(find build/Build/Products -type d -path '*Release-iphoneos/*.app' | head -1 || true)
+
+          test -n "$APP" || {
+            echo '❌ 没找到编译后的 APP'
+            exit 1
+          }
+
+          PLIST="$APP/Info.plist"
+          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null || true)
+
+          test -n "$EXEC" && test -f "$APP/$EXEC" || {
+            echo '❌ 主程序校验失败'
+            exit 1
+          }
+
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null || echo unknown)
+
+          IPA="${EXEC}-V${VER}.ipa"
+
+          rm -rf Payload "$IPA"
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "$IPA" Payload
+          unzip -tq "$IPA"
+
+          echo "file=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: 6A. 上传 IPA
+        if: ${{ steps.inspect.outputs.type != 'theos' && steps.mode.outputs.value != 'preflight' && success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA-${{ github.run_number }}
+          path: src/${{ steps.ipa.outputs.file }}
+          if-no-files-found: error
+
+      - name: 9. 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuildMate-Compile-Logs-${{ github.run_number }}
+          path: |
+            src/compile.log
+            src/compile-errors.txt
+            .buildmate/source-trace.json
+          if-no-files-found: ignore
